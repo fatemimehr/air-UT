@@ -1,9 +1,11 @@
 import logging
 import io
 import os
+import asyncio
 import numpy as np
 import matplotlib.pyplot as plt
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from flask import Flask, request
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -12,8 +14,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from flask import Flask, request
-import telebot
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 # Enable logging
 logging.basicConfig(
@@ -22,6 +23,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- بخش محاسبات علمی (بدون تغییر) ---
+# ... (تمام توابع محاسباتی شما از get_rural_pasquill_gifford_params_c_d تا generate_plot_for_telegram در اینجا قرار می‌گیرد)
+# ... (کد این بخش طولانی است و چون تغییری نکرده، برای خلاصه‌سازی حذف شده است. شما باید آن را از کد قبلی خود کپی کنید)
 def get_rural_pasquill_gifford_params_c_d(stability_class):
     params = {'A':{'c':24.1670,'d':2.5334},'B':{'c':18.3330,'d':1.8096},'C':{'c':12.5000,'d':1.0857},'D':{'c':8.3330,'d':0.72382},'E':{'c':6.2500,'d':0.54287},'F':{'c':4.1667,'d':0.36191}}
     return params.get(stability_class)
@@ -70,7 +73,6 @@ def get_rural_sigma_z_params_a_b(stability_class, x_km):
         if 30.01 <= x_km <= 60.00: return {'a': 27.074, 'b': 0.27436}
         return {'a': 34.219, 'b': 0.21716}
     return None
-
 def calculate_concentration(
     x_receptor, y_receptor, z_receptor, Q_emission, u_ref, z_ref,
     stability_class, area_type, Hm_boundary_layer, ds_stack_diameter,
@@ -80,7 +82,6 @@ def calculate_concentration(
     trace_log = ""
     g = 9.8
     if x_receptor <= 0: return 0.0, "فاصله x باید مثبت باشد."
-    # ... (بقیه کد محاسباتی شما بدون تغییر در اینجا قرار می‌گیرد)
     p_exponent_map = {
         'rural': {'A': 0.07, 'B': 0.07, 'C': 0.10, 'D': 0.15, 'E': 0.35, 'F': 0.55},
         'urban': {'A': 0.15, 'B': 0.15, 'C': 0.20, 'D': 0.25, 'E': 0.30, 'F': 0.30}
@@ -92,8 +93,6 @@ def calculate_concentration(
     trace_log += f"با توجه به کلاس پایداری '{stability_class}' و نوع منطقه '{area_type}'، ضریب توان p={p:.2f} است.\n"
     trace_log += f"Us = U_ref * (hs / z_ref)^p\n"
     trace_log += f"Us = {u_ref} * ({hs_stack_height} / {z_ref})^{p:.2f} = {us:.2f} m/s\n\n"
-
-    # Steps 3 & 4: Conditionally calculate sigma-y
     x_km = x_receptor / 1000.0
     trace_log += f"--- ۲. محاسبه ضریب پراکندگی افقی (σy) برای x={x_receptor} متر ---\n"
     if area_type == 'rural':
@@ -112,8 +111,6 @@ def calculate_concentration(
         sigma_y = C_sy * x_receptor * factor
         trace_log += f"منطقه شهری (urban) انتخاب شد. ضریب: C_sy={C_sy}\n"
         trace_log += f"σy = {C_sy} * x * (1 + 0.0004*x)^-0.5 = {sigma_y:.2f} متر\n\n"
-
-    # Steps 5 & 6: Conditionally calculate sigma-z
     trace_log += f"--- ۳. محاسبه ضریب پراکندگی عمودی (σz) برای x={x_receptor} متر ---\n"
     if area_type == 'rural':
         if stability_class == 'A' and x_km > 3.11:
@@ -137,8 +134,6 @@ def calculate_concentration(
         else: sigma_z = 0.08 * x_receptor * (1.0 + 0.0015 * x_receptor) ** -0.5
         trace_log += f"منطقه شهری (urban) انتخاب شد.\n"
         trace_log += f"مقدار محاسبه شده: σz = {sigma_z:.2f} متر\n\n"
-
-    # Step 7: Calculate effective stack height (he)
     trace_log += f"--- ۴. محاسبه ارتفاع موثر دودکش (he) ---\n"
     delta_T = Ts_stack_temp - Ta_ambient_temp
     Fb = g * vs_stack_velocity * (ds_stack_diameter**2) * (delta_T / (4 * Ts_stack_temp))
@@ -188,15 +183,11 @@ def calculate_concentration(
             if is_stable: he = h_prime_s + 1.6 * ((Fm * x_receptor**2) / (beta_j**2 * us**2))**(1/3)
             else: he = h_prime_s + ((3 * Fm * x_receptor) / (beta_j**2 * us**2))**(1/3)
         trace_log += f"گام ۴.۷: چون x < xf، از فرمول خیز تدریجی استفاده شد. he = {he:.2f} متر\n\n"
-
-    # Step 9: Calculate effective sigmas
     sigma_ye = np.sqrt(sigma_y**2 + (delta_h / 3.5)**2)
     sigma_ze = np.sqrt(sigma_z**2 + (delta_h / 3.5)**2)
     trace_log += f"--- ۵. محاسبه ضرایب پراکندگی موثر ---\n"
     trace_log += f"σye = (σy² + (Δh/3.5)²)^0.5 = {sigma_ye:.2f} متر\n"
     trace_log += f"σze = (σz² + (Δh/3.5)²)^0.5 = {sigma_ze:.2f} متر\n\n"
-    
-    # Step 8: Calculate the vertical term (V)
     if sigma_ze == 0: sigma_ze = 1e-6
     term1 = np.exp(-0.5 * ((z_receptor - he) / sigma_ze)**2)
     term2 = np.exp(-0.5 * ((z_receptor + he) / sigma_ze)**2)
@@ -210,8 +201,6 @@ def calculate_concentration(
     V += summation_term
     trace_log += f"--- ۶. محاسبه جمله قائم (V) ---\n"
     trace_log += f"با در نظر گرفتن انعکاس از زمین و لایه مرزی، V = {V:.4f}\n\n"
-    
-    # Step 10: Calculate the decay term (D)
     trace_log += f"--- ۷. محاسبه جمله زوال (D) ---\n"
     if T_half_life > 0:
         psi = 0.693 / T_half_life
@@ -221,8 +210,6 @@ def calculate_concentration(
     else: 
         D = 1.0
         trace_log += f"آلاینده پایدار فرض شد (نیمه عمر=0)، D = 1.0\n\n"
-        
-    # Final Step: Calculate concentration (C)
     trace_log += f"--- ۸. محاسبه غلظت نهایی (C) ---\n"
     K = 1e6
     if sigma_ye == 0: sigma_ye = 1e-6
@@ -232,9 +219,7 @@ def calculate_concentration(
     C = (Q_emission * K * V * D / denominator) * lateral_term
     trace_log += f"C = (Q*K*V*D) / (2*π*Us*σye*σze) * exp[-0.5*(y/σye)²]\n"
     trace_log += f"C = ({Q_emission} * {K} * {V:.2f} * {D:.2f}) / (2*π*{us:.2f}*{sigma_ye:.2f}*{sigma_ze:.2f}) * exp[-0.5*({y_receptor}/{sigma_ye:.2f})²]\n"
-    
     return C, trace_log
-    
 def generate_plot_for_telegram(params, single_point_coords):
     grid_resolution = 80
     x_max_m = 10000; y_max_m = 2000
@@ -264,12 +249,17 @@ def generate_plot_for_telegram(params, single_point_coords):
     plt.close(fig)
     return buf
 
-# ---------------------------------------------------------------------------
-# Part 2: Telegram Bot Implementation (PERSIAN UI)
-# ---------------------------------------------------------------------------
+# --- بخش ربات تلگرام (اصلاح شده برای وب‌هوک) ---
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("توکن تلگرام یافت نشد!")
+
+# تعریف Conversation states
 (GET_X, GET_Y, GET_Z, GET_Q, GET_U_REF, GET_Z_REF, GET_STABILITY, GET_AREA, GET_HM, 
  GET_DS, GET_HS, GET_TS, GET_TA, GET_VS_CHOICE, GET_VS, GET_QS, GET_HALF_LIFE) = range(17)
 
+# ... (تمام توابع مربوط به ربات مانند start, calculate_start, get_x و غیره در اینجا قرار می‌گیرد)
+# ... (کد این بخش طولانی است و چون تغییری نکرده، برای خلاصه‌سازی حذف شده است. شما باید آن را از کد قبلی خود کپی کنید)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_message = (
         "به نام خدا\n"
@@ -283,7 +273,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "برای شروع یک محاسبه جدید، دستور /calculate را ارسال کنید."
     )
     await update.message.reply_text(welcome_message)
-
 async def calculate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -292,7 +281,6 @@ async def calculate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "۱. لطفاً فاصله در راستای باد (x) را به متر وارد کنید:"
     )
     return GET_X
-
 async def get_numeric_input(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, next_prompt: str, next_state: int, is_float: bool = True):
     try:
         value = float(update.message.text) if is_float else int(update.message.text)
@@ -302,8 +290,6 @@ async def get_numeric_input(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     except ValueError:
         await update.message.reply_text("ورودی نامعتبر است. لطفاً یک عدد صحیح وارد کنید.")
         return context.user_data.get('current_state', -1)
-
-# Refactored handlers to be cleaner
 async def get_x(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['current_state'] = GET_X
     return await get_numeric_input(update, context, 'x', "۲. فاصله عرضی از محور باد (y) به متر:", GET_Y)
@@ -396,55 +382,41 @@ async def get_qs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, KeyError):
         await update.message.reply_text("ورودی نامعتبر است. لطفاً یک عدد برای دبی وارد کنید.")
         return GET_QS
-
 async def get_half_life_and_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         context.user_data['T_half_life'] = float(update.message.text)
     except ValueError:
         await update.message.reply_text("ورودی نامعتبر است. لطفاً یک عدد برای نیمه عمر وارد کنید.")
         return GET_HALF_LIFE
-
     await update.message.reply_text("تمام ورودی‌ها دریافت شد. لطفاً برای انجام محاسبات صبر کنید...", reply_markup=ReplyKeyboardRemove())
-    
     single_point_coords = {'x': context.user_data.pop('x'), 'y': context.user_data.pop('y'), 'z': context.user_data.pop('z')}
     scenario_params = context.user_data
-
     concentration, trace_report = calculate_concentration(
         x_receptor=single_point_coords['x'], y_receptor=single_point_coords['y'], z_receptor=single_point_coords['z'],
         **scenario_params
     )
-    
-    # Send the detailed trace first
     await update.message.reply_text(f"📝 **گزارش گام به گام محاسبات:**\n\n`{trace_report}`", parse_mode='Markdown')
-    
-    # Send the final result
     await update.message.reply_text(
         f"✅ **نتیجه نهایی**\n\n"
         f"غلظت محاسبه شده در نقطه (x={single_point_coords['x']}, y={single_point_coords['y']}, z={single_point_coords['z']}) برابر است با:\n"
         f"**{concentration:.4f} میکروگرم بر متر مکعب**"
     , parse_mode='Markdown')
-
     await update.message.reply_text("در حال آماده‌سازی نمودار... این مرحله ممکن است کمی طول بکشد.")
     plot_buffer = generate_plot_for_telegram(scenario_params, single_point_coords)
     await context.bot.send_photo(chat_id=update.effective_chat.id, photo=plot_buffer, caption="نمودار توزیع غلظت آلاینده.")
-
     await update.message.reply_text("محاسبه کامل شد! برای شروع یک محاسبه جدید، دستور /calculate را ارسال کنید.")
     context.user_data.clear()
     return ConversationHandler.END
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("عملیات لغو شد.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise ValueError("توکن تلگرام یافت نشد. لطفاً آن را در متغیرهای محیطی Render تنظیم کنید.")
 
-bot = telebot.TeleBot(TOKEN)
+# ساخت Application
 application = Application.builder().token(TOKEN).build()
-app = Flask(__name__)
 
+# تعریف Conversation Handler
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler("calculate", calculate_start)],
     states={
@@ -469,29 +441,22 @@ conv_handler = ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel)],
 )
 
+# اضافه کردن Handler ها
 application.add_handler(CommandHandler("start", start))
 application.add_handler(conv_handler)
 
-@app.route('/' + TOKEN, methods=['POST'])
-def getMessage():
-    json_string = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
-    return "!", 200
+# ساخت اپلیکیشن وب Flask
+app = Flask(__name__)
 
-@app.route("/")
-def webhook():
-    bot.remove_webhook()
-    # آدرس وب‌سرویس شما در Render را در اینجا قرار دهید
-    # مثلا: https://your-bot-name.onrender.com/
-    # توجه: باید یک / در انتهای آدرس باشد
-    WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
-    if WEBHOOK_URL:
-        bot.set_webhook(url=WEBHOOK_URL + TOKEN)
-        return "Webhook set up successfully!", 200
-    else:
-        return "RENDER_EXTERNAL_URL not set!", 500
+@app.route(f'/{TOKEN}', methods=['POST'])
+async def webhook_handler():
+    """این تابع درخواست‌های تلگرام را به application منتقل می‌کند"""
+    update_data = request.get_json()
+    update = Update.de_json(data=update_data, bot=application.bot)
+    await application.process_update(update)
+    return 'ok'
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+@app.route('/')
+def index():
+    """یک صفحه ساده برای اطمینان از بالا بودن سرویس"""
+    return 'Bot is running!'
